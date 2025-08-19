@@ -1,10 +1,12 @@
 import os
+import boto3
 from langchain_core.runnables import RunnableConfig
 from typing import Optional, List
 from pydantic import BaseModel, Field
 from langgraph.prebuilt import create_react_agent
 from tools_agent.utils.tools import create_rag_tool
 from langchain.chat_models import init_chat_model
+from langchain_aws import ChatBedrockConverse
 from tools_agent.utils.token import fetch_tokens
 from mcp.client.streamable_http import streamablehttp_client
 from mcp import ClientSession
@@ -14,13 +16,11 @@ from tools_agent.utils.tools import (
     create_langchain_mcp_tool,
 )
 
-
 UNEDITABLE_SYSTEM_PROMPT = "\nIf the tool throws an error requiring authentication, provide the user with a Markdown link to the authentication page and prompt them to authenticate."
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant that has access to a variety of tools."
 )
-
 
 class RagConfig(BaseModel):
     rag_url: Optional[str] = None
@@ -49,17 +49,13 @@ class MCPConfig(BaseModel):
 
 class GraphConfigPydantic(BaseModel):
     model_name: Optional[str] = Field(
-        default="openai:gpt-4o",
+        default="bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0",
         metadata={
             "x_oap_ui_config": {
                 "type": "select",
-                "default": "openai:gpt-4o",
+                "default": "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0",
                 "description": "The model to use in all generations",
                 "options": [
-                    {
-                        "label": "Claude Sonnet 4",
-                        "value": "anthropic:claude-sonnet-4-0",
-                    },
                     {
                         "label": "Claude 3.7 Sonnet",
                         "value": "anthropic:claude-3-7-sonnet-latest",
@@ -69,16 +65,12 @@ class GraphConfigPydantic(BaseModel):
                         "value": "anthropic:claude-3-5-sonnet-latest",
                     },
                     {
-                        "label": "Claude 3.5 Haiku",
-                        "value": "anthropic:claude-3-5-haiku-latest",
+                        "label": "Claude 3.5 Sonnet (Bedrock)",
+                        "value": "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0",
                     },
-                    {"label": "o4 mini", "value": "openai:o4-mini"},
-                    {"label": "o3", "value": "openai:o3"},
-                    {"label": "o3 mini", "value": "openai:o3-mini"},
                     {"label": "GPT 4o", "value": "openai:gpt-4o"},
                     {"label": "GPT 4o mini", "value": "openai:gpt-4o-mini"},
                     {"label": "GPT 4.1", "value": "openai:gpt-4.1"},
-                    {"label": "GPT 4.1 mini", "value": "openai:gpt-4.1-mini"},
                 ],
             }
         },
@@ -154,7 +146,8 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
     model_to_key = {
         "openai:": "OPENAI_API_KEY",
         "anthropic:": "ANTHROPIC_API_KEY", 
-        "google": "GOOGLE_API_KEY"
+        "google": "GOOGLE_API_KEY",
+        "bedrock:": "AWS_ACCESS_KEY_ID"
     }
     key_name = next((key for prefix, key in model_to_key.items() 
                     if model_name.startswith(prefix)), None)
@@ -243,12 +236,35 @@ async def graph(config: RunnableConfig):
             print(f"Failed to fetch MCP tools: {e}")
             pass
 
-    model = init_chat_model(
-        cfg.model_name,
-        temperature=cfg.temperature,
-        max_tokens=cfg.max_tokens,
-        api_key=get_api_key_for_model(cfg.model_name, config) or "No token found"
-    )
+    # Initialize model based on provider
+    if cfg.model_name.lower().startswith("bedrock:"):
+        # Extract model name for Bedrock
+        bedrock_model_name = cfg.model_name.split(":", 1)[1]
+        
+        # Create Bedrock client using asyncio.to_thread to avoid blocking
+        import asyncio
+        bedrock_client = await asyncio.to_thread(
+            boto3.client,
+            "bedrock-runtime", 
+            region_name=os.getenv("AWS_DEFAULT_REGION", "us-west-2"),
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+            aws_session_token=os.getenv("AWS_SESSION_TOKEN")  # Optional
+        )
+        
+        model = ChatBedrockConverse(
+            model=bedrock_model_name,
+            temperature=cfg.temperature,
+            max_tokens=cfg.max_tokens,
+            client=bedrock_client,
+        )
+    else:
+        model = init_chat_model(
+            cfg.model_name,
+            temperature=cfg.temperature,
+            max_tokens=cfg.max_tokens,
+            api_key=get_api_key_for_model(cfg.model_name, config) or "No token found"
+        )
 
     return create_react_agent(
         prompt=cfg.system_prompt + UNEDITABLE_SYSTEM_PROMPT,
